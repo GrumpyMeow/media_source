@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 from io import BytesIO
+import os
 import logging
 import mimetypes
 from pathlib import Path
@@ -32,6 +34,8 @@ from .const import (
     MEDIA_MIME_TYPES,
     THUMBNAIL_QUALITY,
     THUMBNAIL_SIZE,
+    THUMBNAIL_CACHE,
+    THUMBNAIL_CACHE_DIR
 )
 from .models import BrowseMediaSource, MediaSource, MediaSourceItem, PlayMedia
 
@@ -216,6 +220,7 @@ class LocalMediaView(HomeAssistantView):
         """Initialize the media view."""
         self.hass = hass
         self.source = source
+        self._ffmpeg = hass.data[DATA_FFMPEG]
 
     async def get(
         self, request: web.Request, source_dir_id: str, location: str
@@ -287,25 +292,44 @@ class LocalMediaThumbnailView(HomeAssistantView):
             mime_type and mime_type.split("/")[0], MEDIA_CLASS_DIRECTORY
         )
 
-        img = await self.__get_image(media_class, media_path)
+        # Cache parameters
+        cache_filename =  os.path.join( THUMBNAIL_CACHE_DIR, source_dir_id, "{}.jpg".format(str(location)))
+        _LOGGER.error(source_dir_id, location , cache_filename)
 
-        if not img:
-            raise web.HTTPNotFound()
+        if THUMBNAIL_CACHE and os.path.isfile(cache_filename):
+            img = Image.open(cache_filename)
+        else:
+            img = await self.__get_image(media_class, media_path)
 
-        exif = b""
-        # Get raw exif data for thumbnail (keep orientation and other info)
-        if img.info:
-            exif = img.info.get("exif", b"")
+            if not img:
+                raise web.HTTPNotFound()
 
-        img.thumbnail(THUMBNAIL_SIZE, Image.HAMMING)
+            exif = b""
+            # Get raw exif data for thumbnail (keep orientation and other info)
+            if img.info:
+                exif = img.info.get("exif", b"")
 
-        # Convert unsupported JPEG modes
-        if img.mode not in ("RGB", "L", "CMYK"):
-            img = img.convert("RGB")
+            img.thumbnail(THUMBNAIL_SIZE, Image.HAMMING)
 
-        # save thumbnail to buffer
-        data = BytesIO()
-        img.save(data, format="jpeg", exif=exif, quality=THUMBNAIL_QUALITY)
+            # Convert unsupported JPEG modes
+            if img.mode not in ("RGB", "L", "CMYK"):
+                img = img.convert("RGB")
+
+            # save thumbnail to buffer
+            data = BytesIO()
+            img.save(data, format="jpeg", exif=exif, quality=THUMBNAIL_QUALITY)
+
+            if THUMBNAIL_CACHE:
+                if not os.path.exists(os.path.dirname(cache_filename)):
+                    try:
+                        os.makedirs(os.path.dirname(cache_filename))
+                    except OSError as exc: # Guard against race condition
+                        if exc.errno != errno.EEXIST:
+                            raise
+
+                with open(cache_filename, 'w') as f:
+                    img.save(f)
+
 
         resp = web.StreamResponse(
             status=200,
@@ -329,9 +353,10 @@ class LocalMediaThumbnailView(HomeAssistantView):
         if media_class == MEDIA_CLASS_MUSIC:
             try:
                 audio = File(media_path)
-                apic = audio.tags.get("APIC:")
-                if apic:
-                    img = Image.open(BytesIO(apic.data))
+                if audio:
+                    apic = audio.tags.get("APIC:")
+                    if apic:
+                        img = Image.open(BytesIO(apic.data))
             except OSError as err:
                 _LOGGER.warning("Failed to create thumbnail for music '%s", media_path)
                 raise ValueError() from err
@@ -340,7 +365,7 @@ class LocalMediaThumbnailView(HomeAssistantView):
             try:
                 ffmpeg = ImageFrame(self._ffmpeg.binary)
                 image = await asyncio.shield(
-                    ffmpeg.get_image(media_path, output_format=IMAGE_JPEG)
+                    ffmpeg.get_image(shlex.quote(str(media_path)), output_format=IMAGE_JPEG)
                 )
                 if image:
                     img = Image.open(BytesIO(image))

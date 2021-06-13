@@ -1,5 +1,5 @@
 {
-    "name": "Thumbnail media_source",
+    "name": "Thumbnail local media_source",
     "hacs": "0.0.1",
     "domains": [ "media_source" ],
     "homeassistant": "0.110.0"
